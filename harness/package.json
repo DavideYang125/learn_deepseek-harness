@@ -1,0 +1,14 @@
+{
+  "name": "minimal-harness",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "最小可运行版 deepseek-harness（学习用）",
+  "scripts": {
+    "start": "node --experimental-strip-types harness.ts",
+    "start:tsx": "tsx harness.ts"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0"
+  }
+}
