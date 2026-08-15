@@ -12,7 +12,7 @@
  *   node --experimental-strip-types harness.ts "在工作区写一个 hello.js 并用 node 运行，输出 Hello Agent"
  *
  * 概念对照（详见上级 README.md 第 7 节）：
- *   chat()         → ① API 客户端 + 捕获 reasoning_content（思考过程）
+ *   chat()         → ① API 客户端 + 捕获 reasoning_content（思考仅展示，不回传）
  *   TOOLS + SYSTEM → ② 工具 schema + 系统提示词（agent 的人设与能力清单）
  *   executeTool()  → ③ 工具执行器（文件/命令真实生效）
  *   parseJson()    → ④ 结构化输出解析（模型输出 JSON，失败就回喂重试）
@@ -29,7 +29,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const WORKSPACE = join(__dirname, "workspace"); // agent 真正干活、产出文件的地方（沙箱）
 const STATE_FILE = join(__dirname, "state.json"); // 每步快照，支持断点续跑
 const API_URL = "https://api.deepseek.com/chat/completions";
-const MODEL = "deepseek-reasoner"; // 可改成 deepseek-chat 对比差异
+// 2026-08 起官方模型名只有 deepseek-v4-flash（快/便宜）和 deepseek-v4-pro（更强）。
+// 旧名 deepseek-chat / deepseek-reasoner 目前仍被服务端当别名接受，但已不在官方清单，随时可能下线。
+const DEFAULT_MODEL = "deepseek-v4-flash"; // 可用 .env 里的 DEEPSEEK_MODEL 覆盖
 const MAX_ITER = 30; // 循环上限，防止死循环
 
 // ---------- 0. 极简 .env 加载（避免引入 dotenv 依赖） ----------
@@ -53,7 +55,7 @@ async function chat(messages: any[], maxTokens: number) {
       Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
     },
     body: JSON.stringify({
-      model: MODEL,
+      model: process.env.DEEPSEEK_MODEL ?? DEFAULT_MODEL,
       messages,
       max_tokens: maxTokens,
       stream: false,
@@ -62,7 +64,7 @@ async function chat(messages: any[], maxTokens: number) {
   if (!res.ok) throw new Error(`API ${res.status}: ${(await res.text()).slice(0, 500)}`);
   const data: any = await res.json();
   const msg = data.choices[0].message;
-  // deepseek-reasoner 会在 content 之外额外返回 reasoning_content（思考过程）
+  // V4 系列 thinking 模式默认开启，会在 content 之外额外返回 reasoning_content（思考过程）
   return { content: msg.content ?? "", reasoning: msg.reasoning_content ?? "" };
 }
 
@@ -165,9 +167,10 @@ async function main() {
     console.log(`\n── 迭代 ${i + 1}/${MAX_ITER} ──`);
 
     const { content, reasoning } = await chat(messages, maxTokens);
-    // 把思考过程也存进历史（DeepSeek 官方建议回喂以延续推理思路）。
-    // 若你的 API 版本不接受该字段，删掉 reasoning_content 这一行即可。
-    messages.push({ role: "assistant", content, reasoning_content: reasoning });
+    if (reasoning) console.log(`💭 思考 ${reasoning.length} 字符（仅展示）`);
+    // 注意：DeepSeek API 不允许把 reasoning_content 放进输入消息（会返回 400）。
+    // 官方做法是只回传 content 保持上下文连贯，思考过程不回传。
+    messages.push({ role: "assistant", content });
 
     let step: any;
     try {

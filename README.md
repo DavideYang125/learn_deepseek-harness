@@ -124,7 +124,7 @@ node --experimental-strip-types harness.ts "在工作区写一个 hello.js，用
 ### ① API 客户端（`chat()`）
 只做一件事：调 DeepSeek，把 `content`（回答）和 `reasoning_content`（思考）分开拿回。后一个字段是 Reasoner 专属，也是后面"思考回喂"的前提。
 
-> 🛠️ **实践 1**：跑一个简单任务，观察日志里 `🤔` 打印的思考与最终回答的区别。把 `MODEL` 改成 `deepseek-chat` 再跑一次，对比行为差异。
+> 🛠️ **实践 1**：跑一个简单任务，观察日志里 `🤔` 打印的思考与最终回答的区别。在 `.env` 里设 `DEEPSEEK_MODEL=deepseek-v4-pro` 再跑一次，对比行为差异。（注：`deepseek-chat`/`deepseek-reasoner` 旧名已于 2026-07-24 后停用，现在统一用 `deepseek-v4-flash`/`deepseek-v4-pro`）
 
 ### ② 工具 schema + 系统提示词（`TOOLS` / `SYSTEM`）
 模型不能直接"用工具"，它只能**描述**想用什么工具、传什么参数。`TOOLS` 是能力清单，`SYSTEM` 是把它"包装成人设 + 输出协议"。**协议（JSON 格式）是你完全自己掌控的，这是学会"协议设计"的最好入口。**
@@ -196,7 +196,7 @@ node --experimental-strip-types harness.ts "在工作区写一个 hello.js，用
 ## 10. 参考资料
 
 - **原版**：`steipete/deepseek-harness`（GitHub）——当年那个单文件，读它的代码注释，很多 design decision 写得坦诚
-- **DeepSeek API 文档**：`api-docs.deepseek.com`——重点读 `reasoning_content`、`max_tokens`、`deepseek-reasoner` 与 `deepseek-chat` 差异
+- **DeepSeek API 文档**：`api-docs.deepseek.com`——重点读 `reasoning_content`、`max_tokens`、thinking 模式（low/high/max effort）、以及 `/updates` 变更日志（模型名变更第一时间看这里）
 - **Anthropic《Building effective agents》**——讲清 "workflow vs agent"，所有 agent 架构入门必读
 - **ReAct 论文**（Yao et al.）——"思考-行动-观察"模式原始出处，本 harness 的循环就是它的工程化
 - **Tool use / function calling 文档**——工具协议设计的通用做法
