@@ -6,6 +6,7 @@
   "description": "最小可运行版 deepseek-harness（学习用）",
   "scripts": {
     "start": "node --experimental-strip-types harness.ts",
+    "start:fc": "node --experimental-strip-types harness-fc.ts",
     "start:tsx": "tsx harness.ts",
     "typecheck": "tsc --noEmit"
   },

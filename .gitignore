@@ -1,6 +1,7 @@
 # ===== 密钥与运行产物（绝不提交） =====
 harness/.env
 harness/state.json
+harness/state-fc.json
 harness/workspace/
 
 # ===== 依赖 =====
