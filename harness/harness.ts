@@ -12,12 +12,14 @@
  *   node --experimental-strip-types harness.ts "在工作区写一个 hello.js 并用 node 运行，输出 Hello Agent"
  *
  * 概念对照（详见上级 README.md 第 7 节）：
- *   chat()         → ① API 客户端 + 捕获 reasoning_content（思考仅展示，不回传）
+ *   chat()         → ① API 客户端（流式 SSE：边收边打印）+ 捕获 reasoning_content（思考仅展示，不回传）
  *   TOOLS + SYSTEM → ② 工具 schema + 系统提示词（agent 的人设与能力清单）
  *   executeTool()  → ③ 工具执行器（文件/命令真实生效）
  *   parseJson()    → ④ 结构化输出解析（模型输出 JSON，失败就回喂重试）
  *   saveState/load → ⑤ 状态落盘：断点续跑 + 自增上下文（"越干越聪明"的关键）
  *   maxTokens 递增 → ⑥ Token 预算递增（先小后大，越写越长）
+ *   spillIfNeeded → ⑦ 工具输出溢出：超限结果落盘，模型只看头尾预览 + 取回指引
+ *   maybeCompact  → ⑧ 上下文压缩：历史超阈值时，把中段摘要成一条消息
  */
 
 import { execSync } from "node:child_process";
@@ -34,6 +36,12 @@ const API_URL = "https://api.deepseek.com/chat/completions";
 const DEFAULT_MODEL = "deepseek-v4-flash"; // 可用 .env 里的 DEEPSEEK_MODEL 覆盖
 const MAX_ITER = 30; // 循环上限，防止死循环
 
+// —— 上下文管理两件套（monorepo 对应 packages/spill + packages/compaction）——
+const SPILL_DIR = join(WORKSPACE, "spill"); // 超大工具输出的完整原文存这里（模型用 read_file 取回）
+const MAX_INLINE = Number(process.env.SPILL_MAX_INLINE ?? 2000); // 单个工具结果超过这个字符数就 spill
+const COMPACT_THRESHOLD = Number(process.env.COMPACT_THRESHOLD ?? 4000); // 估算 token 超过这个数就压缩历史
+const KEEP_TAIL = 6; // 压缩时保留最近几条消息不动（模型的"短期记忆"）
+
 // ---------- 0. 极简 .env 加载（避免引入 dotenv 依赖） ----------
 function loadDotEnv() {
   const p = join(__dirname, ".env");
@@ -46,8 +54,13 @@ function loadDotEnv() {
   }
 }
 
-// ---------- 1. API 客户端：把"思考"和"回答"分开拿回来 ----------
+// ---------- 1. API 客户端：流式（SSE）——边收边打印，不再干等整段 ----------
+// monorepo 对应物：agent.ts step() 的 `for await (const chunk of stream)` + BlockAssembler。
+// 非流式是 `await res.json()` 一把等完；流式把回复切成小块（delta）持续推送，
+// 价值 = 首字延迟（TTFT）远小于总耗时，且思考过程能实时看到。
 async function chat(messages: any[], maxTokens: number) {
+  const t0 = Date.now();
+  let ttft: number | undefined; // time-to-first-token：第一个字到达用了多久
   const res = await fetch(API_URL, {
     method: "POST",
     headers: {
@@ -58,14 +71,57 @@ async function chat(messages: any[], maxTokens: number) {
       model: process.env.DEEPSEEK_MODEL ?? DEFAULT_MODEL,
       messages,
       max_tokens: maxTokens,
-      stream: false,
+      stream: true, // ① 打开流式
+      stream_options: { include_usage: true }, // ⑤ 最后一块额外带 token 用量
     }),
   });
   if (!res.ok) throw new Error(`API ${res.status}: ${(await res.text()).slice(0, 500)}`);
-  const data: any = await res.json();
-  const msg = data.choices[0].message;
+  if (!res.body) throw new Error("响应没有 body，无法流式读取");
+
+  // ② SSE 解析三件套：
+  //    TextDecoder(stream:true) —— 防止中文字符（多字节 UTF-8）被网络分块切成乱码
+  //    buf 攒半截事件          —— 一个网络 chunk 可能只有半个 SSE 事件，攒够再处理
+  //    \n\n 是事件边界          —— SSE 协议规定事件之间用空行分隔
+  const decoder = new TextDecoder();
+  let buf = "";
+  let content = "";
+  let reasoning = "";
+  let usage: any;
+  let showedReasoning = false;
+  let showedContent = false;
+
+  // ③ Node 18+ 的 res.body 是 async iterable，写法和 monorepo 的流式消费同款
+  for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+    buf += decoder.decode(chunk, { stream: true });
+    let sep: number;
+    while ((sep = buf.indexOf("\n\n")) !== -1) {
+      const event = buf.slice(0, sep);
+      buf = buf.slice(sep + 2);
+      for (const line of event.split(/\r?\n/)) {
+        if (!line.startsWith("data: ")) continue; // 跳过注释行（: keep-alive）等非数据行
+        const payload = line.slice(6);
+        if (payload === "[DONE]") continue; // ④ 流结束哨兵
+        const json = JSON.parse(payload);
+        if (json.usage) usage = json.usage; // include_usage 的最后一块 choices 为空，只有用量
+        const delta = json.choices?.[0]?.delta ?? {};
+        if (delta.reasoning_content) {
+          if (ttft === undefined) ttft = Date.now() - t0;
+          if (!showedReasoning) { process.stdout.write("\n💭 "); showedReasoning = true; }
+          reasoning += delta.reasoning_content;
+          process.stdout.write(delta.reasoning_content); // 思考实时上屏
+        }
+        if (delta.content) {
+          if (ttft === undefined) ttft = Date.now() - t0;
+          if (!showedContent) { process.stdout.write("\n📄 "); showedContent = true; }
+          content += delta.content;
+          process.stdout.write(delta.content); // 正文实时上屏
+        }
+      }
+    }
+  }
+  process.stdout.write("\n");
   // V4 系列 thinking 模式默认开启，会在 content 之外额外返回 reasoning_content（思考过程）
-  return { content: msg.content ?? "", reasoning: msg.reasoning_content ?? "" };
+  return { content, reasoning, usage, ttft: ttft ?? -1, total: Date.now() - t0 };
 }
 
 // ---------- 2. 工具 schema + 系统提示词 ----------
@@ -90,7 +146,7 @@ function executeTool(name: string, args: any): string {
     case "run_command":
       try {
         const out = execSync(args.command, { encoding: "utf8", cwd: args.cwd ?? WORKSPACE });
-        return out.slice(0, 8000); // 截断，防止单次输出撑爆上下文
+        return out; // 不在这里截断——超限与否交给统一的 spill 策略（见 spillIfNeeded）
       } catch (e) {
         // 关键：失败返回 stderr 而非抛异常，让模型"看到错误并自我修复"
         return `EXIT ${(e as any).status}\n${(e as any).stdout ?? ""}\n${(e as any).stderr ?? ""}`;
@@ -102,12 +158,29 @@ function executeTool(name: string, args: any): string {
       return `OK 已写入 ${args.path}（${args.content.length} 字符）`;
     }
     case "read_file":
-      return readFileSync(join(WORKSPACE, args.path), "utf8").slice(0, 8000);
+      return readFileSync(join(WORKSPACE, args.path), "utf8"); // 限量策略同样交给 spillIfNeeded
     case "list_files":
       return readdirSync(join(WORKSPACE, args.path ?? ".")).join("\n");
     default:
       return `未知工具：${name}`;
   }
+}
+
+// ---------- 3b. 工具输出 spill：超限的完整输出落盘，模型只看"头尾预览 + 取回指引" ----------
+// monorepo 对应物：packages/spill/spill-policy（tools/post-execute 结果转换器）。
+// 旧版是 result.slice(0, 8000)：尾巴被静默丢弃，模型既看不全、也不知道丢了东西。
+// spill 版：完整原文写进 workspace/spill/，模型拿到头尾预览 + 文件名，需要细节时自己 read_file 取回。
+function spillIfNeeded(name: string, output: string): string {
+  if (output.length <= MAX_INLINE) return output;
+  // read 工具豁免：如果 read_file 的结果也 spill，模型为了看全得去 read 溢出文件，
+  // 结果又超限又 spill…… 死循环。monorepo 对 read 有完全相同的豁免（read 自行负责限量）。
+  if (name === "read_file") return output.slice(0, 8000);
+  mkdirSync(SPILL_DIR, { recursive: true });
+  const fname = `spill-${Date.now().toString(36)}-${name}.txt`;
+  writeFileSync(join(SPILL_DIR, fname), output);
+  const head = output.slice(0, Math.floor(MAX_INLINE / 2));
+  const tail = output.slice(-Math.floor(MAX_INLINE / 2));
+  return `${head}\n…（中间省略 ${output.length - MAX_INLINE} 字符）…\n${tail}\n[完整输出已存到 workspace/spill/${fname}，需要细节时用 read_file 读取该文件]`;
 }
 
 // ---------- 4. 结构化输出解析：鲁棒 + 失败可回喂重试 ----------
@@ -129,6 +202,57 @@ function loadState(): any {
     return JSON.parse(readFileSync(STATE_FILE, "utf8"));
   } catch {
     return null;
+  }
+}
+
+// ---------- 5b. 上下文压缩：历史太长时，把中段摘要成一条消息（monorepo: packages/compaction）----------
+// 触发时机和 monorepo 一致：发请求之前检查（它的 pressure 触发挂在 agent/pre-step）。
+// 动作：保留 [0]system、[1]任务、最近 KEEP_TAIL 条，中段交给一次独立的摘要 LLM 调用，
+// 替换成一条 user 消息。摘要失败不致命——原样发送，下轮再试（尽力而为，同 monorepo 容错哲学）。
+
+// 粗略 token 估算：中文约 2 字符/token、英文约 4 字符/token，折中除 2。
+// monorepo 用真正的 tokenMeter；教学版一个除法就够说明问题。
+function estimateTokens(messages: any[]): number {
+  return Math.ceil(messages.reduce((n, m) => n + String(m.content ?? "").length, 0) / 2);
+}
+
+async function summarize(text: string): Promise<string> {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
+    body: JSON.stringify({
+      model: process.env.DEEPSEEK_MODEL ?? DEFAULT_MODEL,
+      messages: [
+        {
+          role: "system",
+          content:
+            "你是对话压缩器。把输入的 agent 工作记录压缩成不超过 300 字的要点，必须保留：任务目标、已完成的事、关键文件名/命令/结论、未完成的事。直接输出要点。",
+        },
+        { role: "user", content: text },
+      ],
+      max_tokens: 1000,
+      stream: false,
+    }),
+  });
+  if (!res.ok) throw new Error(`摘要 API ${res.status}`);
+  return (await res.json()).choices[0].message.content;
+}
+
+async function maybeCompact(messages: any[]) {
+  const before = estimateTokens(messages);
+  if (before < COMPACT_THRESHOLD) return;
+  const body = messages.slice(2, -KEEP_TAIL); // 中段（保留 system、任务、尾部）
+  if (body.length === 0) return;
+  try {
+    const text = body.map((m: any) => `[${m.role}] ${m.content}`).join("\n\n");
+    const summary = await summarize(text);
+    messages.splice(2, body.length, {
+      role: "user",
+      content: `[早期进展摘要（系统自动压缩，替代之前 ${body.length} 条消息）]\n${summary}`,
+    });
+    console.log(`🗜️  上下文压缩：${body.length} 条消息 → 1 条摘要（估算 ${before} → ${estimateTokens(messages)} tokens）`);
+  } catch (e: any) {
+    console.log(`🗜️  压缩失败（${e.message}），本轮原样发送`);
   }
 }
 
@@ -166,8 +290,13 @@ async function main() {
   for (let i = 0; i < MAX_ITER; i++) {
     console.log(`\n── 迭代 ${i + 1}/${MAX_ITER} ──`);
 
-    const { content, reasoning } = await chat(messages, maxTokens);
-    if (reasoning) console.log(`💭 思考 ${reasoning.length} 字符（仅展示）`);
+    await maybeCompact(messages); // 发请求前检查压力，超阈值就把旧历史压成摘要
+
+    // 思考与正文已在 chat() 里实时流式打印，这里只补一行"体检数据"
+    const { content, reasoning, usage, ttft, total } = await chat(messages, maxTokens);
+    console.log(
+      `⚡ 首字 ${ttft}ms ／ 总 ${total}ms ｜ 💭 ${reasoning.length} 字 ｜ 📊 tokens 输入 ${usage?.prompt_tokens ?? "?"} + 输出 ${usage?.completion_tokens ?? "?"}`,
+    );
     // 注意：DeepSeek API 不允许把 reasoning_content 放进输入消息（会返回 400）。
     // 官方做法是只回传 content 保持上下文连贯，思考过程不回传。
     messages.push({ role: "assistant", content });
@@ -192,7 +321,8 @@ async function main() {
       continue;
     }
 
-    const result = executeTool(step.action.name, step.action.args);
+    // 执行后统一过 spill 策略（monorepo 是 post-execute 转换器，不写死在每个工具里）
+    const result = spillIfNeeded(step.action.name, executeTool(step.action.name, step.action.args));
     console.log(`🔧 ${step.action.name} → ${result.slice(0, 160).replace(/\n/g, " ")}`);
     messages.push({ role: "user", content: `工具 ${step.action.name} 返回：\n${result}` });
 
